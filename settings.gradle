@@ -1,0 +1,45 @@
+pluginManagement {
+	repositories {
+		gradlePluginPortal()
+             maven{ url 'http://maven.aliyun.com/nexus/content/groups/public/' }
+             maven{ url 'http://repo.springsource.org/plugins-release'}
+             maven{ url 'https://maven.aliyun.com/repository/public'}
+             maven{ url 'http://maven.aliyun.com/nexus/content/repositories/jcenter'}
+
+	}
+}
+apply from: "$rootDir/gradle/build-cache-settings.gradle"
+
+include "spring-aop"
+include "spring-aspects"
+include "spring-beans"
+include "spring-context"
+include "spring-context-indexer"
+include "spring-context-support"
+include "spring-core"
+include "kotlin-coroutines"
+project(':kotlin-coroutines').projectDir = file('spring-core/kotlin-coroutines')
+include "spring-expression"
+include "spring-instrument"
+include "spring-jcl"
+include "spring-jdbc"
+include "spring-jms"
+include "spring-messaging"
+include "spring-orm"
+include "spring-oxm"
+include "spring-test"
+include "spring-tx"
+include "spring-web"
+include "spring-webflux"
+include "spring-webmvc"
+include "spring-websocket"
+include "framework-bom"
+include "integration-tests"
+
+rootProject.name = "spring"
+rootProject.children.each {project ->
+	project.buildFileName = "${project.name}.gradle"
+}
+include 'untitled'
+include 'spring-yrp'
+
