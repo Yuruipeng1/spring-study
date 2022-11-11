@@ -1,6 +1,4 @@
-```
-invokeBeanFactoryPostProcessors原理
-```
+# 1.invokeBeanFactoryPostProcessors原理
 
 其中最重要的是invokeBeanFactoryPostProcessors方法，先上代码（在代码中已经写了详细的注释）
 
@@ -291,3 +289,511 @@ spring的原则是保证pordered最先执行 (但是只是找的这一次能保�
 第二次执行的时候 拿到ordered接口的和可能新产生的pordered接口的  因为做了sort，所有也能保证
 
 第三次 如果没有新产生的pordered那么顺序也不会乱 但如果新产生了pordered那么和前面的顺序乱了
+
+
+
+# 2.推断构造方法原理
+
+spring推断构造方法有两次推断，第一次是在SmartInstantiationAwareBeanPostProcessor接口中的determineCandidateConstructors方法中推断,由AutowiredAnnotationBeanPostProcessor实现
+
+```java
+public Constructor<?>[] determineCandidateConstructors(Class<?> beanClass, final String beanName)
+      throws BeanCreationException {
+
+   /********************************处理@Lookup注解***********************************/
+   // Let's check for lookup methods here...
+   if (!this.lookupMethodsChecked.contains(beanName)) {
+      if (AnnotationUtils.isCandidateClass(beanClass, Lookup.class)) {
+         try {
+            Class<?> targetClass = beanClass;
+            do {
+               ReflectionUtils.doWithLocalMethods(targetClass, method -> {
+                  Lookup lookup = method.getAnnotation(Lookup.class);
+                  if (lookup != null) {
+                     Assert.state(this.beanFactory != null, "No BeanFactory available");
+                     LookupOverride override = new LookupOverride(method, lookup.value());
+                     try {
+                        RootBeanDefinition mbd = (RootBeanDefinition)
+                              this.beanFactory.getMergedBeanDefinition(beanName);
+                        mbd.getMethodOverrides().addOverride(override);
+                     }
+                     catch (NoSuchBeanDefinitionException ex) {
+                        throw new BeanCreationException(beanName,
+                              "Cannot apply @Lookup to beans without corresponding bean definition");
+                     }
+                  }
+               });
+               targetClass = targetClass.getSuperclass();
+            }
+            while (targetClass != null && targetClass != Object.class);
+
+         }
+         catch (IllegalStateException ex) {
+            throw new BeanCreationException(beanName, "Lookup method resolution failed", ex);
+         }
+      }
+      this.lookupMethodsChecked.add(beanName);
+   }
+
+   /********************************处理@Autowired构造方法***********************************/
+   // Quick check on the concurrent map first, with minimal locking.
+   //获取缓存中的候选构造方法的列表
+   Constructor<?>[] candidateConstructors = this.candidateConstructorsCache.get(beanClass);
+   if (candidateConstructors == null) {
+      // Fully synchronized resolution now...
+      synchronized (this.candidateConstructorsCache) {
+         candidateConstructors = this.candidateConstructorsCache.get(beanClass);
+         if (candidateConstructors == null) {
+            Constructor<?>[] rawCandidates;
+            try {
+               //获取所有构造方法
+               rawCandidates = beanClass.getDeclaredConstructors();
+            }
+            catch (Throwable ex) {
+               throw new BeanCreationException(beanName,
+                     "Resolution of declared constructors on bean Class [" + beanClass.getName() +
+                     "] from ClassLoader [" + beanClass.getClassLoader() + "] failed", ex);
+            }
+            //存储合格的构造方法
+            List<Constructor<?>> candidates = new ArrayList<>(rawCandidates.length);
+            /**这个是存储加了@Autowired而且其中的require=true的构造方法 */
+            Constructor<?> requiredConstructor = null;
+            //这个用来存储默认构造方法
+            Constructor<?> defaultConstructor = null;
+            //获取主构造方法（Kotlin classes相关）
+            /**
+             * 让kotlin来推断primaryConstructor
+             * 如果beanClass这个类不是kotlin类，那么返回null，所有正常情况不用管这个primaryConstructor
+             */
+            Constructor<?> primaryConstructor = BeanUtils.findPrimaryConstructor(beanClass);
+            //记录不是合成方法的构造函数的数量
+            int nonSyntheticConstructors = 0;
+            //遍历构造方法
+            for (Constructor<?> candidate : rawCandidates) {
+               //计数加一
+               if (!candidate.isSynthetic()) {
+                  nonSyntheticConstructors++;
+               }
+               else if (primaryConstructor != null) {
+                  continue;
+               }
+               //获取当前构造方法的@Autowired或者@Value注解信息
+               //拿到require这个属性
+               MergedAnnotation<?> ann = findAutowiredAnnotation(candidate);
+               if (ann == null) {
+                  //获取父类类（解决cglib生成的代理类这种情况）
+                  //此方法的目的是拿到父类类：比如若是被cglib代理过的，那就拿到父类（因为cglib是通过子类的形式加强的）
+                  Class<?> userClass = ClassUtils.getUserClass(beanClass);
+                  // 说明确实是被CGLIB代理过的，那就再解析一次  看看父类是否有@Autowaired这种构造器
+                  if (userClass != beanClass) {
+                     //获取父类类构造方法上的注解信息
+                     try {
+                        Constructor<?> superCtor =
+                              userClass.getDeclaredConstructor(candidate.getParameterTypes());
+                        ann = findAutowiredAnnotation(superCtor);
+                     }
+                     catch (NoSuchMethodException ex) {
+                        // Simply proceed, no equivalent superclass constructor found...
+                     }
+                  }
+               }
+               // 这里是是存在注解标注的这种构造器的
+               if (ann != null) {
+                  // 这个判断很有必要，表示要求的构造器最多只能有一个
+                  //@Autowired标注的构造器数量最多只能有一个（当然，required=true的只能有一个，=false的可以有多个）
+                  if (requiredConstructor != null) {
+                     throw new BeanCreationException(beanName,
+                           "Invalid autowire-marked constructor: " + candidate +
+                           ". Found constructor with 'required' Autowired annotation already: " +
+                           requiredConstructor);
+                  }
+                  //获取@Autowired注解中required属性的值
+                  boolean required = determineRequiredStatus(ann);
+                  //required属性为true的时候，只能存在一个有@Autowired注解的构造方法
+                  if (required) {
+                     if (!candidates.isEmpty()) {
+                        throw new BeanCreationException(beanName,
+                              "Invalid autowire-marked constructors: " + candidates +
+                              ". Found constructor with 'required' Autowired annotation: " +
+                              candidate);
+                     }
+                     //当前构造方法是required=true的构造方法
+                     requiredConstructor = candidate;
+                  }
+                  //将有@Autowired注解的构造方法保存到candidates集合中
+                  candidates.add(candidate);
+               }
+               //没有@Autowired注解，并且当前方法参数为0说明是默认构造方法
+               // 若该构造器没有被标注@Autowired注解，但是它是无参构造器，那就当然候选的构造器
+               else if (candidate.getParameterCount() == 0) {
+                  // 这里注意：虽然把默认的构造函数记录下来了，但是并没有加进candidates里
+                  defaultConstructor = candidate;
+               }
+            }
+            if (!candidates.isEmpty()) {
+               //有加了@Autowired的构造方法
+               // Add default constructor to list of optional constructors, as fallback.
+               // 这个是candidates里面有值了，并且还没有requiredConstructor
+               // （相当于标注了注解@Autowired，但是required=false）的情况下，会把默认的构造函数加进candidates
+               if (requiredConstructor == null) {
+                  if (defaultConstructor != null) {
+                     //将默认构造方法添加到候选构造方法中
+                     candidates.add(defaultConstructor);
+                  }
+                  //不存在默认构造方法，且只有一个构造方法加了@Autowired注解，打印一下日志信息
+                  else if (candidates.size() == 1 && logger.isInfoEnabled()) {
+                     logger.info("Inconsistent constructor declaration on bean with name '" + beanName +
+                           "': single autowire-marked constructor flagged as optional - " +
+                           "this constructor is effectively required since there is no " +
+                           "default constructor to fall back to: " + candidates.get(0));
+                  }
+               }
+               //集合转数组
+               candidateConstructors = candidates.toArray(new Constructor<?>[0]);
+            }
+            //没有加@Autowired的构造方法，且只有一个有参的构造方法，那么就使用当前构造方法
+            else if (rawCandidates.length == 1 && rawCandidates[0].getParameterCount() > 0) {
+               candidateConstructors = new Constructor<?>[] {rawCandidates[0]};
+            }
+            //没有加@Autowired的构造方法，主构造方法（Kotlin classes相关）和defaultConstructor不为空，那么就使用primaryConstructor和默认构造方法
+            //这个条件一般都不成立，只有当前类为kotlin时才考虑
+            else if (nonSyntheticConstructors == 2 && primaryConstructor != null &&
+                  defaultConstructor != null && !primaryConstructor.equals(defaultConstructor)) {
+               candidateConstructors = new Constructor<?>[] {primaryConstructor, defaultConstructor};
+            }
+            //没有加@Autowired的构造方法，主构造方法（Kotlin classes相关）不为空，那么就使用primaryConstructor
+            else if (nonSyntheticConstructors == 1 && primaryConstructor != null) {
+               candidateConstructors = new Constructor<?>[] {primaryConstructor};
+            }
+            //空的构造方法数组
+            else {
+               candidateConstructors = new Constructor<?>[0];
+            }
+            //缓存当前解析过的构造方法
+            this.candidateConstructorsCache.put(beanClass, candidateConstructors);
+         }
+      }
+   }
+   // 若有多个构造函数，但是没有一个标记了@Autowired,此处不会报错，但是返回null，交给后面的策略处理
+   return (candidateConstructors.length > 0 ? candidateConstructors : null);
+}
+```
+
+1.推断有几个构造方法
+determineCandidateConstructors原理：
+如果只有一个默认构造方法，不推断，为0，因为后面返回null直接调用无参构造方法就行.(没必要推断)
+如果提供了两个以上（包含默认构造方法），且没有加@Autowire，那么spring就会迷茫，不知道用哪个，就直接返回null。(后面又是调用无参构造)
+如果只有一个非默认构造方法，那么spring就会推断出这一个来，ctors就有一个值.
+如果有多个且没有默认构造方法，那么会报错.
+对于@Autowire 推断构造方法时，如果require=true，那么只能有一个@Autowire，如果require=false，那么可以有多个@Autowire。
+如果有多个@Autowire标注的构造并且有默认构造方法，就返回@Autowire的数量+1
+如果有多个@Autowire标注的构造并且没有默认构造方法，就返回@Autowire的数量，并且打印日志，不报异常。
+
+
+
+第二次推断构造方法是在autowireConstructor这个方法中
+
+```java
+public BeanWrapper autowireConstructor(String beanName, RootBeanDefinition mbd,
+      @Nullable Constructor<?>[] chosenCtors, @Nullable Object[] explicitArgs) {
+
+   //创建并初始化BeanWrapper
+   BeanWrapperImpl bw = new BeanWrapperImpl();
+   this.beanFactory.initBeanWrapper(bw);
+   //spring决定采用哪个构造方法来实例化bean
+   //代码执行到这里spring已经决定要采用一个特殊构造方法来实例化bean
+   //但是到底用哪个？可能这个类提供了很多构造方法
+   //采用哪个，spring有自己的一套规则
+   //当他找到一个之后他就会把这个构造方法赋值给constructorToUse
+   Constructor<?> constructorToUse = null;
+   //构造方法的值，注意不是参数
+   //在调用反射实例化对象的时候，需要具体的值
+   //这个变量就是用来记录这些值
+   //但是这里要注意argsHolderToUse是一个数据结构
+   //argsToUse[]才是真正的值
+   ArgumentsHolder argsHolderToUse = null;
+   Object[] argsToUse = null;
+
+   //确定参数值列表
+
+   /**
+    * getBean方法可以自定构造方法参数值
+    * <T> T getBean(Class<T> requiredType, Object... args) throws BeansException;
+    */
+   //如果构造参数不为空就直接使用这些参数即可
+   if (explicitArgs != null) {
+      argsToUse = explicitArgs;
+   }
+   else {
+      Object[] argsToResolve = null;
+      synchronized (mbd.constructorArgumentLock) {
+         //获取已解析的构造方法
+         //一般不会有，因为构造方法一般会提供一个
+         //除非有多个，那么才会存在已经解析完成的构造方法
+         //获取缓存的构造方法和参数（主要为方便创建Protype类型的对象）
+         constructorToUse = (Constructor<?>) mbd.resolvedConstructorOrFactoryMethod;
+         if (constructorToUse != null && mbd.constructorArgumentsResolved) {
+            // Found a cached constructor...
+            argsToUse = mbd.resolvedConstructorArguments;
+            if (argsToUse == null) {
+               //获取部分准备好的构造方法参数
+               argsToResolve = mbd.preparedConstructorArguments;
+            }
+         }
+      }
+      //解析部分准备好的构造方法参数
+      if (argsToResolve != null) {
+         argsToUse = resolvePreparedArguments(beanName, mbd, bw, constructorToUse, argsToResolve);
+      }
+   }
+
+   if (constructorToUse == null || argsToUse == null) {
+      // Take specified constructors, if any.
+      /**
+       * 如果指定了构造方法，就从指定的构造方法找出最合适的构造方法
+       * 在bean实例化之前，会调用这个AutowiredAnnotationBeanPostProcessor增强器的
+       * determineCandidateConstructors方法，该方法返回有@Autowired注解的构造方法
+       * chosenCtors就是determineCandidateConstructors方法的返回值
+       */
+      Constructor<?>[] candidates = chosenCtors;
+      //为空的话，就先获取所有构造方法，然后从中找出最合适的构造方法实例化
+      if (candidates == null) {
+         Class<?> beanClass = mbd.getBeanClass();
+         try {
+            /**
+             * mbd.isNonPublicAccessAllowed() 判断是否允许使用非public的构造方法实例化对象
+             * beanClass.getDeclaredConstructors() 获取所有的构造方法
+             * beanClass.getConstructors() 只获取public的构造方法
+             */
+            candidates = (mbd.isNonPublicAccessAllowed() ?
+                  beanClass.getDeclaredConstructors() : beanClass.getConstructors());
+         }
+         catch (Throwable ex) {
+            throw new BeanCreationException(mbd.getResourceDescription(), beanName,
+                  "Resolution of declared constructors on bean Class [" + beanClass.getName() +
+                  "] from ClassLoader [" + beanClass.getClassLoader() + "] failed", ex);
+         }
+      }
+
+      /*******************************单构造方法************************************/
+      if (candidates.length == 1 && explicitArgs == null && !mbd.hasConstructorArgumentValues()) {
+         Constructor<?> uniqueCandidate = candidates[0];
+         //构造方法参数个数为0，实际就是默认构造方法
+         if (uniqueCandidate.getParameterCount() == 0) {
+            //缓存构造方法和参数
+            synchronized (mbd.constructorArgumentLock) {
+               mbd.resolvedConstructorOrFactoryMethod = uniqueCandidate;
+               mbd.constructorArgumentsResolved = true;
+               mbd.resolvedConstructorArguments = EMPTY_ARGS;
+            }
+            //使用该构造方法实例化
+            bw.setBeanInstance(instantiate(beanName, mbd, uniqueCandidate, EMPTY_ARGS));
+            return bw;
+         }
+      }
+
+      /*******************************多构造方法************************************/
+      // Need to resolve the constructor.
+      //要么指定了构造方法，要么开启了自动注入构造
+      boolean autowiring = (chosenCtors != null ||
+            mbd.getResolvedAutowireMode() == AutowireCapableBeanFactory.AUTOWIRE_CONSTRUCTOR);
+      //存放解析出来的参数
+      ConstructorArgumentValues resolvedValues = null;
+
+      //定义了最小参数个数
+      //如果你给构造方法的参数列表给定了具体的值
+      //那么这些值的个数就是构造方法参数的个数
+      int minNrOfArgs;
+      //当你手动调用doGetbean方法并且args参数有值时，explicitArgs才不为空
+      if (explicitArgs != null) {
+         minNrOfArgs = explicitArgs.length;
+      }
+      else {
+         /**
+          * cargs获取构造方法的值，注意是值不是类型和列表
+          */
+         //获取beanDefinition中缓存的构造方法参数值ConstructorArgumentValues
+         ConstructorArgumentValues cargs = mbd.getConstructorArgumentValues();
+         //resolvedValues实例化一个对象，用来存放构造方法的参数值
+         resolvedValues = new ConstructorArgumentValues();
+         //类型和个数是spring用来确定使用哪个构造方法的重要信息
+         minNrOfArgs = resolveConstructorArguments(beanName, mbd, bw, cargs, resolvedValues);
+      }
+
+      //根据构造方法的访问权限级别和参数数量进行排序
+      //怎么排序呢？
+      //先对访问权限排，再对参数数量
+      /**
+       * 对构造方法进行排序,会按照如下顺序
+       * public并且方法参数越多越靠前
+       * 非public并且方法参数越多越靠前
+       */
+      AutowireUtils.sortConstructors(candidates);
+      //定义了一个差异变量，默认值为最大值int的
+      //spring会根据每个构造方法的差异量，选出一个最小的
+      int minTypeDiffWeight = Integer.MAX_VALUE;
+      //存储模糊不清的（差异值相同）的构造方法
+      Set<Constructor<?>> ambiguousConstructors = null;
+      LinkedList<UnsatisfiedDependencyException> causes = null;
+
+      //循环所有构造方法
+      for (Constructor<?> candidate : candidates) {
+         //获取当前构造方法的参数数量
+         int parameterCount = candidate.getParameterCount();
+
+         //满足下面三个条件，说明该构造方法可用，直接使用当前构造方法和参数
+         /**
+          * 这个判断别看只有一行代码理解起来很费劲
+          * 首先constructorToUse != null这个很好理解，
+          * *前面已经说过首先constructorToUise主要是用来装已经解析过了并且在使用的构造方法*
+          * 只有在他等于空的情况下，才有继续的意义，因为下面如果解析到了一个符合的构造方法
+          * *就会赋值给这个变量（下面注释有写)。故而如果这个变量不等于null就不需要再进行解析了，
+          * 说明spring已经找到一个合适的构造方法，直接使用便可以
+          * * argsToUse.length > paramTypes.length这个代码就相当复杂了
+          * *首先假设 argsToUse = [1，"luban", obj]
+          * * argsToUse>paramTypes这个很精髓-------因为排序，因为有多个，第二次循环
+          * *多到少，如果第一个都比argsToUse小，那么后面的就不需要去判断了
+          */
+         if (constructorToUse != null && argsToUse != null && argsToUse.length > parameterCount) {
+            // Already found greedy constructor that can be satisfied ->
+            // do not look any further, there are only less greedy constructors left.
+            break;
+         }
+         //匹配的参数数量不够，继续下一个构造方法
+         if (parameterCount < minNrOfArgs) {
+            continue;
+         }
+
+         ArgumentsHolder argsHolder;
+         //获取构造方法的参数类型
+         Class<?>[] paramTypes = candidate.getParameterTypes();
+         if (resolvedValues != null) {
+            try {
+               /**
+                * 解析@ConstructorProperties注解
+                * 这个注解实际上就是显示指定构造方法的参数名
+                * 通过此注解可以直接获取参数名
+                */
+               //@ConstructorProperties(value={"xxx","111"})
+               String[] paramNames = ConstructorPropertiesChecker.evaluate(candidate, parameterCount);
+               if (paramNames == null) {
+                  //没有手动标注参数名，就使用ParameterNameDiscoverer解析构造方法的参数名
+                  ParameterNameDiscoverer pnd = this.beanFactory.getParameterNameDiscoverer();
+                  if (pnd != null) {
+                     /**
+                      * 获取构造方法的参数名列表
+                      * 实际上流程很简单，都是反射的知识
+                      * Parameter[] parameters=Constructor.getParameters() 获取所有的参数
+                      * parameter.getName() 遍历获取每个参数的参数名字
+                      */
+                     paramNames = pnd.getParameterNames(candidate);
+                  }
+               }
+               //获取构造方法参数值列表
+               /**
+                * 创建ArgumentsHolder
+                * getUserDeclaredConstructor(candidate)
+                * 从名字上理解，就是获取用户声明的构造方法，这主要是避免这么一种情况，
+                * 当前这个构造方法所属的类是由cglib生成的子类，那么此时，就不能使用子类的
+                * 必须得获取原始类的构造方法
+                */
+               /**
+                *这个方法比较复杂
+                * 因为spring只能提供字符串的参数值
+                * 故而需要进行转换
+                * argsHolder所包含的值就是转换之后的
+                */
+               argsHolder = createArgumentArray(beanName, mbd, resolvedValues, bw, paramTypes, paramNames,
+                     getUserDeclaredConstructor(candidate), autowiring, candidates.length == 1);
+            }
+            catch (UnsatisfiedDependencyException ex) {
+               if (logger.isTraceEnabled()) {
+                  logger.trace("Ignoring constructor [" + candidate + "] of bean '" + beanName + "': " + ex);
+               }
+               // Swallow and try next constructor.
+               if (causes == null) {
+                  causes = new LinkedList<>();
+               }
+               causes.add(ex);
+               continue;
+            }
+         }
+         else {
+            // Explicit arguments given -> arguments length must match exactly.
+            if (parameterCount != explicitArgs.length) {
+               continue;
+            }
+            argsHolder = new ArgumentsHolder(explicitArgs);
+         }
+
+         /**
+          * mbd.isLenientConstructorResolution()获取构造方法的匹配模式（宽松、严格）
+          * 使用算法计算出当前构造方法的权重值（值越小越匹配）
+          */
+         int typeDiffWeight = (mbd.isLenientConstructorResolution() ?
+               argsHolder.getTypeDifferenceWeight(paramTypes) : argsHolder.getAssignabilityWeight(paramTypes));
+         // Choose this constructor if it represents the closest match.
+         //使用权重值小的构造方法
+         if (typeDiffWeight < minTypeDiffWeight) {
+            //将当前构造方法设置为使用的构造方法
+            constructorToUse = candidate;
+            argsHolderToUse = argsHolder;
+            //将当前参数设置为构造方法使用的参数
+            argsToUse = argsHolder.arguments;
+            //覆盖上一个构造方法的权重值
+            minTypeDiffWeight = typeDiffWeight;
+            ambiguousConstructors = null;
+         }
+         else if (constructorToUse != null && typeDiffWeight == minTypeDiffWeight) {
+            if (ambiguousConstructors == null) {
+               ambiguousConstructors = new LinkedHashSet<>();
+               ambiguousConstructors.add(constructorToUse);
+            }
+            ambiguousConstructors.add(candidate);
+         }
+      }
+
+      //找不到合适的构造方法，抛异常
+      if (constructorToUse == null) {
+         if (causes != null) {
+            UnsatisfiedDependencyException ex = causes.removeLast();
+            for (Exception cause : causes) {
+               this.beanFactory.onSuppressedException(cause);
+            }
+            throw ex;
+         }
+         throw new BeanCreationException(mbd.getResourceDescription(), beanName,
+               "Could not resolve matching constructor on bean class [" + mbd.getBeanClassName() + "] " +
+               "(hint: specify index/type/name arguments for simple parameters to avoid type ambiguities)");
+      }
+      else if (ambiguousConstructors != null && !mbd.isLenientConstructorResolution()) {
+         throw new BeanCreationException(mbd.getResourceDescription(), beanName,
+               "Ambiguous constructor matches found on bean class [" + mbd.getBeanClassName() + "] " +
+               "(hint: specify index/type/name arguments for simple parameters to avoid type ambiguities): " +
+               ambiguousConstructors);
+      }
+
+      //缓存当前使用的构造方法和参数，以备下次实例化对象使用
+      if (explicitArgs == null && argsHolderToUse != null) {
+         argsHolderToUse.storeCache(mbd, constructorToUse);
+      }
+   }
+
+   Assert.state(argsToUse != null, "Unresolved constructor arguments");
+   //instantiate  实例化对象
+   bw.setBeanInstance(instantiate(beanName, mbd, constructorToUse, argsToUse));
+   return bw;
+}
+```
+
+2.推断选择哪个构造方法
+
+autowireConstructor原理:
+首先会判断第一次推断构造方法有没有返回值，如果为null，则会根据是否允许使用非public的构造方法实例化对象获取所有构造方法或public构造
+方法，如果不为null，以第一次推断得到的来进行选择。
+如果只有一个构造方法并且为默认构造方法，就选择这个默认无参的构造进行实例化.
+有多个构造方法的情况：
+对这些构造方法先进行排序，排序规则为先按访问权限进行排，再对参数数量进行排，public并且方法参数越多越靠前
+该方法中有个非常重要的变量minTypeDiffWeight，这是一个差异变量，spring会根据每个构造方法的差异量，选出一个最小的
+如果有多个相同差异变量的构造方法，如果spring使用宽松的模式解析构造函数（默认使用），就选取，第一个被解析的构造方法，
+如果不使用，就报错。
