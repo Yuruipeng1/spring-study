@@ -797,3 +797,157 @@ autowireConstructor原理:
 该方法中有个非常重要的变量minTypeDiffWeight，这是一个差异变量，spring会根据每个构造方法的差异量，选出一个最小的
 如果有多个相同差异变量的构造方法，如果spring使用宽松的模式解析构造函数（默认使用），就选取，第一个被解析的构造方法，
 如果不使用，就报错。
+
+# 3.循环依赖
+
+首先说一下循环依赖的大致流程
+
+A->推断构造方法->实例化->进行属性注入(假设这时要注入B)->getB->new B->进行B的属性注入（这时要注入A）
+
+->getA(因为spring默认开启了循环依赖，所以此时能获取到A，如果A还需要被代理的话，此时会返回A的代理对象)->A注入到B->B走完bean的生命周期，进入容器->然后A注入B->A走完bean的生命周期->到这里的话循环依赖完成。
+
+最主要的是进行B的属性注入时为什么能够获取到A?
+
+首先，A在属性注入前，会提前暴露一个工厂对象
+
+```java
+// Eagerly cache singletons to be able to resolve circular references
+// even when triggered by lifecycle interfaces like BeanFactoryAware.
+//spring为了解决循环依赖而做的工作
+/**
+ * 判断是否需要提前将该bean实例暴露
+ * isSingletonCurrentlyInCreation(beanName) 判断当前beanName对应的bean是否正在创建
+ * 只会暴露当前正在创建的单例bean
+ */
+//如果当前bean是单例，且支持循环依赖，且当前bean正在创建，通过往singletonFactories添加一个objectFactory，
+// 这样后期如果有其他bean依赖该bean 可以从singletonFactories获取到bean
+//getEarlyBeanReference可以对返回的bean进行修改，这边目前除了可能会返回动态代理对象 其他的都是直接返回bean
+boolean earlySingletonExposure = (mbd.isSingleton() && this.allowCircularReferences &&
+      isSingletonCurrentlyInCreation(beanName));
+if (earlySingletonExposure) {
+   if (logger.isTraceEnabled()) {
+      logger.trace("Eagerly caching bean '" + beanName +
+            "' to allow for resolving potential circular references");
+   }
+   /**
+    * 创建一个ObjectFactory，它的getObject方法返回的是经过getEarlyBeanReference方法
+    * 增强的bean（此时的bean才刚实例化完成，还没有经过属性填充和初始化）
+    * 并把这个ObjectFactory工厂放入第二级缓存中
+    */
+   addSingletonFactory(beanName, () -> getEarlyBeanReference(beanName, mbd, bean));
+}
+```
+
+```java
+protected void addSingletonFactory(String beanName, ObjectFactory<?> singletonFactory) {
+   Assert.notNull(singletonFactory, "Singleton factory must not be null");
+   //singletonObjects 一级缓存
+   synchronized (this.singletonObjects) {
+      /**
+       * 如果单例池当中不存在才会add
+       * 因为这里主要是为了循环依赖服务的代码
+       * 如果bean存在单例池的话其实已经是一个完整的bean了
+       * 一个完整的bean自然已经完成了属性注入，循环依赖已经依赖上了
+       * 所以如果这个对象已经是一个完整bean，就不需要关系，不需要进if
+       */
+      if (!this.singletonObjects.containsKey(beanName)) {
+         //把工厂对象put到二级缓存---singletonFactories
+         this.singletonFactories.put(beanName, singletonFactory);
+         //从三级缓存中remove掉当前bean
+         //为什么需要remove？抛开细节，这三个map当中其实存的就是一个对象
+         //spring的做法是三个不能同时都存，假如1存了，则2和3就要remove
+         //现在既然put到了2级缓存，1已经判断没有了，3就直接remove
+         this.earlySingletonObjects.remove(beanName);
+         this.registeredSingletons.add(beanName);
+      }
+   }
+}
+```
+
+当A进行属性注入，要注入B，此时容器中没有，会getB，然后创建B，对B进行属性注入，然后又要getA，在doGetBean()方法中有一句非常重要的代码
+
+```
+Object sharedInstance = getSingleton(beanName);
+```
+
+他会先从容器获取A，此时因为A提前暴露了一个工厂对象，所以能通过这个工厂对象的getObject方法获取到一个半成品A，或者一个被代理的A
+
+```java
+protected Object getSingleton(String beanName, boolean allowEarlyReference) {
+   // Quick check for existing instance without full singleton lock
+   //从单例池（一级缓存）中直接拿
+   //这也是为什么getBean("xx")能获取一个初始化好bean的根本代码
+   Object singletonObject = this.singletonObjects.get(beanName);
+   //如果这个时候是x注入y，创建y，y注入x，获取x的时候那么x不在容器
+   //第一个singletonObject==null成立
+   //第二个条件判断是否存在正在创建bean的集合中，前面分析是成立的
+   //进入if分支
+   if (singletonObject == null && isSingletonCurrentlyInCreation(beanName)) {
+      //先从三级缓存拿x？为什么先从三级缓存拿？
+      //避免x已经产生过一次，为什么？ 如果x还依赖z，z也依赖x,那么这次就能从这里拿到x不用再走下面的流程
+      singletonObject = this.earlySingletonObjects.get(beanName);
+      //这里应该是拿不到的，因为这三个map中只有二级缓存中存了一个工厂对象
+      //所以三级缓存拿到的singletonObject==null 第一个条件成立
+      //第二个条件allowEarlyReference=true，这个前文设置过
+      //就是spring循环依赖的开关，默认为true 进入if分支
+      if (singletonObject == null && allowEarlyReference) {
+         synchronized (this.singletonObjects) {
+            // Consistent creation of early reference within full singleton lock
+            singletonObject = this.singletonObjects.get(beanName);
+            if (singletonObject == null) {
+               singletonObject = this.earlySingletonObjects.get(beanName);
+               if (singletonObject == null) {
+                  //从二级缓存中获取一个singletonFactory
+                  //由于这里的beanName=x，故而获取出来的工厂对象，能产生一个x半成品bean
+                  // 某些方法提前初始化的时候会调用addSingletonFactory，把ObjectFactory缓存在singletonFactories中
+                  ObjectFactory<?> singletonFactory = this.singletonFactories.get(beanName);
+                  //由于获取到了，进入if分支
+                  if (singletonFactory != null) {
+                     //调用工厂对象的getObject（）方法，产生一个x的半成品bean
+                     //怎么产生的？
+                     singletonObject = singletonFactory.getObject();
+                     //拿到了半成品的xbean后，把他放到三级缓存，为什么？
+                     // 为了下次再次获取时能直接拿到，而不需要再次生成
+                     this.earlySingletonObjects.put(beanName, singletonObject);
+                     //然后从二级缓存中清除掉x的工厂对象，为什么？
+                     // 为了gc,提高性能
+                     this.singletonFactories.remove(beanName);
+                  }
+               }
+            }
+         }
+      }
+   }
+   return singletonObject;
+}
+```
+
+工厂对象的getObject实际就是调用getEarlyBeanReference方法
+
+```java
+protected Object getEarlyBeanReference(String beanName, RootBeanDefinition mbd, Object bean) {
+   Object exposedObject = bean;
+   if (!mbd.isSynthetic() && hasInstantiationAwareBeanPostProcessors()) {
+      for (BeanPostProcessor bp : getBeanPostProcessors()) {
+         if (bp instanceof SmartInstantiationAwareBeanPostProcessor) {
+            SmartInstantiationAwareBeanPostProcessor ibp = (SmartInstantiationAwareBeanPostProcessor) bp;
+            //可以调用getEarlyBeanReference对实例化后的bean增强
+            exposedObject = ibp.getEarlyBeanReference(exposedObject, beanName);
+         }
+      }
+   }
+   return exposedObject;
+}
+```
+
+spring中有三个map
+
+```java
+//一级缓存
+private final Map<String, Object> singletonObjects = new ConcurrentHashMap<>(256);
+//二级缓存
+private final Map<String, ObjectFactory<?>> singletonFactories = new HashMap<>(16);
+//三级缓存
+private final Map<String, Object> earlySingletonObjects = new ConcurrentHashMap<>(16);
+```
+
