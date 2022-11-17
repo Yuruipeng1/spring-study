@@ -1,3 +1,5 @@
+前言:spring中最重要的就是refresh方法，所以学习spring源码主要围绕这个方法进行学习。
+
 # 1.invokeBeanFactoryPostProcessors原理
 
 其中最重要的是invokeBeanFactoryPostProcessors方法，先上代码（在代码中已经写了详细的注释）
@@ -1404,3 +1406,5 @@ autowiredBeanName = determineAutowireCandidate(matchingBeans, descriptor);
 ```
 
 这就是@Autowired先根据类型获取，获取不到，再根据名字获取的原理.
+
+# 5.自动注入原理(以AUTOWIRE_BY_TYPE为例)
