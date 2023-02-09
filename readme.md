@@ -1702,3 +1702,300 @@ pvs.add(propertyName, autowiredArgument);
 ```
 
 最后等待applyPropertyValues(beanName, mbd, bw, pvs);统一赋值，到此autowireByType的逻辑大概结束了。
+
+
+
+# 6.initializeBean 原理(Bean的初始化)
+
+```java
+protected Object initializeBean(String beanName, Object bean, @Nullable RootBeanDefinition mbd) {
+   //安全检查
+   if (System.getSecurityManager() != null) {
+      AccessController.doPrivileged((PrivilegedAction<Object>) () -> {
+         invokeAwareMethods(beanName, bean);
+         return null;
+      }, getAccessControlContext());
+   }
+   else {
+      /**
+       * 执行部分aware接口方法，注入容器内部的对象
+       * 先后顺序为BeanNameAware，BeanClassLoaderAware，BeanFactoryAware
+       */
+      invokeAwareMethods(beanName, bean);
+   }
+
+   Object wrappedBean = bean;
+   if (mbd == null || !mbd.isSynthetic()) {
+      //执行部分Aware方法 和注解版 lifecycle init callback（比如@PostConstruct）
+      //执行所有BeanPostProcessor的postProcessBeforeInitialization方法
+      wrappedBean = applyBeanPostProcessorsBeforeInitialization(wrappedBean, beanName);
+   }
+
+   try {
+      // 执行 接口版 lifecycle init callback 比如 InitializingBean的 afterPropertiesSet()
+      //还有xml或注解@Bean中的init初始化方法
+      invokeInitMethods(beanName, wrappedBean, mbd);
+   }
+   catch (Throwable ex) {
+      throw new BeanCreationException(
+            (mbd != null ? mbd.getResourceDescription() : null),
+            beanName, "Invocation of init method failed", ex);
+   }
+   if (mbd == null || !mbd.isSynthetic()) {
+      //执行所有BeanPostProcessor的postProcessAfterInitialization方法
+      /**
+       * 完成aop---生成代理
+       * 事件发布 监听
+       */
+      wrappedBean = applyBeanPostProcessorsAfterInitialization(wrappedBean, beanName);
+   }
+
+   return wrappedBean;
+}
+```
+
+invokeAwareMethods方法执行部分aware方法
+
+```java
+private void invokeAwareMethods(String beanName, Object bean) {
+   if (bean instanceof Aware) {
+      if (bean instanceof BeanNameAware) {
+         ((BeanNameAware) bean).setBeanName(beanName);
+      }
+      if (bean instanceof BeanClassLoaderAware) {
+         ClassLoader bcl = getBeanClassLoader();
+         if (bcl != null) {
+            ((BeanClassLoaderAware) bean).setBeanClassLoader(bcl);
+         }
+      }
+      if (bean instanceof BeanFactoryAware) {
+         ((BeanFactoryAware) bean).setBeanFactory(AbstractAutowireCapableBeanFactory.this);
+      }
+   }
+}
+```
+
+
+
+ApplicationContextAwareProcessor类中的postProcessBeforeInitialization方法执行了部分aware接口方法
+
+```java
+public Object postProcessBeforeInitialization(Object bean, String beanName) throws BeansException {
+   //未实现这些aware接口就什么也不做
+   if (!(bean instanceof EnvironmentAware || bean instanceof EmbeddedValueResolverAware ||
+         bean instanceof ResourceLoaderAware || bean instanceof ApplicationEventPublisherAware ||
+         bean instanceof MessageSourceAware || bean instanceof ApplicationContextAware)){
+      return bean;
+   }
+
+   AccessControlContext acc = null;
+
+   if (System.getSecurityManager() != null) {
+      acc = this.applicationContext.getBeanFactory().getAccessControlContext();
+   }
+
+   if (acc != null) {
+      AccessController.doPrivileged((PrivilegedAction<Object>) () -> {
+         invokeAwareInterfaces(bean);
+         return null;
+      }, acc);
+   }
+   else {
+      //执行Aware接口方法
+      invokeAwareInterfaces(bean);
+   }
+
+   return bean;
+}
+```
+
+```java
+private void invokeAwareInterfaces(Object bean) {
+   if (bean instanceof EnvironmentAware) {
+      ((EnvironmentAware) bean).setEnvironment(this.applicationContext.getEnvironment());
+   }
+   if (bean instanceof EmbeddedValueResolverAware) {
+      ((EmbeddedValueResolverAware) bean).setEmbeddedValueResolver(this.embeddedValueResolver);
+   }
+   if (bean instanceof ResourceLoaderAware) {
+      ((ResourceLoaderAware) bean).setResourceLoader(this.applicationContext);
+   }
+   //ApplicationEventPublisher就是应用上下文对象
+   if (bean instanceof ApplicationEventPublisherAware) {
+      ((ApplicationEventPublisherAware) bean).setApplicationEventPublisher(this.applicationContext);
+   }
+   if (bean instanceof MessageSourceAware) {
+      ((MessageSourceAware) bean).setMessageSource(this.applicationContext);
+   }
+   if (bean instanceof ApplicationContextAware) {
+      ((ApplicationContextAware) bean).setApplicationContext(this.applicationContext);
+   }
+}
+```
+
+@PostConstruct执行流程
+
+InitDestroyAnnotationBeanPostProcessor类的postProcessBeforeInitialization方法
+
+```java
+public Object postProcessBeforeInitialization(Object bean, String beanName) throws BeansException {
+   //获取所有生命周期元数据
+   LifecycleMetadata metadata = findLifecycleMetadata(bean.getClass());
+   try {
+      //执行生命周期初始化方法
+      metadata.invokeInitMethods(bean, beanName);
+   }
+   catch (InvocationTargetException ex) {
+      throw new BeanCreationException(beanName, "Invocation of init method failed", ex.getTargetException());
+   }
+   catch (Throwable ex) {
+      throw new BeanCreationException(beanName, "Failed to invoke init method", ex);
+   }
+   return bean;
+}
+```
+
+```java
+private LifecycleMetadata findLifecycleMetadata(Class<?> clazz) {
+   /**
+    * 先查缓存中有没有生命周期元数据
+    * this.lifecycleMetadataCache是一个map集合，它的key就是当前类的clazz
+    * value是当前类的生命周期元数据
+    */
+   if (this.lifecycleMetadataCache == null) {
+      // Happens after deserialization, during destruction...
+      //直接去获取生命周期元数据，重点方法
+      return buildLifecycleMetadata(clazz);
+   }
+   // Quick check on the concurrent map first, with minimal locking.
+   LifecycleMetadata metadata = this.lifecycleMetadataCache.get(clazz);
+   if (metadata == null) {
+      synchronized (this.lifecycleMetadataCache) {
+         metadata = this.lifecycleMetadataCache.get(clazz);
+         if (metadata == null) {
+            //直接去获取生命周期元数据
+            metadata = buildLifecycleMetadata(clazz);
+            //缓存，key就是当前类的clazz
+            this.lifecycleMetadataCache.put(clazz, metadata);
+         }
+         return metadata;
+      }
+   }
+   return metadata;
+}
+```
+
+```java
+private LifecycleMetadata buildLifecycleMetadata(final Class<?> clazz) {
+   /**
+    * this.initAnnotationType为PostConstruct.class
+    * this.destroyAnnotationType为PreDestroy.class
+    * 在CommonAnnotationBeanPostProcessor默认的构造方法中赋值
+    * AnnotationUtils.isCandidateClass()是判断clazz中是否存在PostConstruct和PreDestroy注解
+    */
+   if (!AnnotationUtils.isCandidateClass(clazz, Arrays.asList(this.initAnnotationType, this.destroyAnnotationType))) {
+      //不存在PostConstruct和PreDestroy注解，直接返回一个空的生命周期元数据
+      return this.emptyLifecycleMetadata;
+   }
+
+   List<LifecycleElement> initMethods = new ArrayList<>();
+   List<LifecycleElement> destroyMethods = new ArrayList<>();
+   Class<?> targetClass = clazz;
+
+   do {
+      final List<LifecycleElement> currInitMethods = new ArrayList<>();
+      final List<LifecycleElement> currDestroyMethods = new ArrayList<>();
+
+      /**
+       * ReflectionUtils.doWithLocalMethods()方法很简单，其实就是遍历targetClass所有的
+       * 方法，将它作为参数回调接口方法。这个方法我在说@Autowired原理的时候已经详细解释过了，这里
+       * 不在多费唇舌
+       * 真正的处理逻辑在参数2的lamada表达式中
+       */
+      ReflectionUtils.doWithLocalMethods(targetClass, method -> {
+         /****************************处理@PostConstruct注解******************************/
+         //method.isAnnotationPresent()判断方法上有没有指定的注解（反射的知识）
+         if (this.initAnnotationType != null && method.isAnnotationPresent(this.initAnnotationType)) {
+            //构建LifecycleElement
+            LifecycleElement element = new LifecycleElement(method);
+            //加入到初始化方法集合中
+            currInitMethods.add(element);
+            if (logger.isTraceEnabled()) {
+               logger.trace("Found init method on class [" + clazz.getName() + "]: " + method);
+            }
+         }
+         /****************************处理@PreDestroy注解******************************/
+         if (this.destroyAnnotationType != null && method.isAnnotationPresent(this.destroyAnnotationType)) {
+            currDestroyMethods.add(new LifecycleElement(method));
+            if (logger.isTraceEnabled()) {
+               logger.trace("Found destroy method on class [" + clazz.getName() + "]: " + method);
+            }
+         }
+      });
+
+      initMethods.addAll(0, currInitMethods);
+      destroyMethods.addAll(currDestroyMethods);
+      //获取父类，因为父类中也有可能指定了生命周期方法
+      targetClass = targetClass.getSuperclass();
+   }
+   while (targetClass != null && targetClass != Object.class);
+   //返回声明周期元数据
+   return (initMethods.isEmpty() && destroyMethods.isEmpty() ? this.emptyLifecycleMetadata :
+         //构建LifecycleMetadata
+         new LifecycleMetadata(clazz, initMethods, destroyMethods));
+}
+```
+
+然后调用metadata.invokeInitMethods(bean, beanName);执行@PostConstruct标注的方法
+
+
+
+```java
+protected void invokeInitMethods(String beanName, Object bean, @Nullable RootBeanDefinition mbd)
+      throws Throwable {
+
+   boolean isInitializingBean = (bean instanceof InitializingBean);
+   // 如果是InitializingBean并且有afterPropertiesSet，调用afterPropertiesSet方法
+   if (isInitializingBean && (mbd == null || !mbd.isExternallyManagedInitMethod("afterPropertiesSet"))) {
+      if (logger.isTraceEnabled()) {
+         logger.trace("Invoking afterPropertiesSet() on bean with name '" + beanName + "'");
+      }
+      if (System.getSecurityManager() != null) {
+         try {
+            AccessController.doPrivileged((PrivilegedExceptionAction<Object>) () -> {
+               ((InitializingBean) bean).afterPropertiesSet();
+               return null;
+            }, getAccessControlContext());
+         }
+         catch (PrivilegedActionException pae) {
+            throw pae.getException();
+         }
+      }
+      else {
+         ((InitializingBean) bean).afterPropertiesSet();
+      }
+   }
+
+   // 如果是InitializingBean，但没有afterPropertiesSet，调用自定义的方法
+   if (mbd != null && bean.getClass() != NullBean.class) {
+      //获取初始化方法的名称
+      String initMethodName = mbd.getInitMethodName();
+      //bean指定了初始化方法
+      if (StringUtils.hasLength(initMethodName) &&
+            //并且不是InitializingBean的实例，指定的初始化方法也不是InitializingBean中的接口方法
+            !(isInitializingBean && "afterPropertiesSet".equals(initMethodName)) &&
+            //并且初始化方法也不是外部管理
+            !mbd.isExternallyManagedInitMethod(initMethodName)) {
+         //执行定制的初始化方法
+         invokeCustomInitMethod(beanName, bean, mbd);
+      }
+   }
+}
+```
+
+先执行InitializingBean接口的afterPropertiesSet方法，然后执行xml中或@Bean中的init初始化方法
+
+最后applyBeanPostProcessorsAfterInitialization中是aop的逻辑，这里先省略。
+
+
+
