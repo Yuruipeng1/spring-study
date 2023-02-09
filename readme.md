@@ -1408,3 +1408,297 @@ autowiredBeanName = determineAutowireCandidate(matchingBeans, descriptor);
 这就是@Autowired先根据类型获取，获取不到，再根据名字获取的原理.
 
 # 5.自动注入原理(以AUTOWIRE_BY_TYPE为例)
+
+首先了解一下java的内省机制：
+
+JavaBean （有get/set属性，和默认构造器等规范的java类）有这样的特征：
+
+- 属性都是私有的；
+- 有无参的public构造方法；
+- 对私有属性根据需要提供公有的getXxx方法以及setXxx方法；
+
+内省(Inspector)机制就是基于反射的基础， Java语言对Bean类属性、事件的一种缺省处理方法。
+
+只要类中有getXXX方法，或者setXXX方法，或者同时有getXXX及setXXX方法，其中getXXX方 法没有方法参数，有返回值； setXXX方法没有返回值，有一个方法参数；那么内省机制就认为 XXX为一个属性；
+
+举一个典型的例子就是Object类的class属性，在Object类中没有class这个字段，但是我们可以通过getClass方法获取Class对象，这就利用了java的内省机制，Object类中有getClass方法，并且没有参数，有返回值，所以就认为Class为一个属性。
+
+内省的关键代码在Introspector类中的getTargetPropertyInfo方法中，代码如下
+
+```java
+if (argCount == 0) {
+    //如果方法名称以get开头
+    if (name.startsWith(GET_PREFIX)) {
+        // Simple getter
+        //截取掉get后的字符串作为属性名称
+        pd = new PropertyDescriptor(this.beanClass, name.substring(3), method, null);
+    } else if (resultType == boolean.class && name.startsWith(IS_PREFIX)) {
+        // Boolean getter
+        //如果方法名称以is开头，截取掉is后的字符串作为属性名称
+        pd = new PropertyDescriptor(this.beanClass, name.substring(2), method, null);
+    }
+} else if (argCount == 1) {
+    //如果方法参数为int类型，且以get开头，pd则为IndexedPropertyDescriptor类型的属性
+    if (int.class.equals(argTypes[0]) && name.startsWith(GET_PREFIX)) {
+        pd = new IndexedPropertyDescriptor(this.beanClass, name.substring(3), null, null, method, null);
+    } else if (void.class.equals(resultType) && name.startsWith(SET_PREFIX)) {
+        // Simple setter
+        //如果方法没有返回值，且参数不为int，方法名称以set开头
+        pd = new PropertyDescriptor(this.beanClass, name.substring(3), null, method);
+        if (throwsException(method, PropertyVetoException.class)) {
+            pd.setConstrained(true);
+        }
+    }
+} else if (argCount == 2) {
+    //如果返回值为void，第一个参数为int，方法名称以set开头，pd为IndexedPropertyDescriptor类型的属性
+        if (void.class.equals(resultType) && int.class.equals(argTypes[0]) && name.startsWith(SET_PREFIX)) {
+        pd = new IndexedPropertyDescriptor(this.beanClass, name.substring(3), null, null, null, method);
+        if (throwsException(method, PropertyVetoException.class)) {
+            pd.setConstrained(true);
+        }
+    }
+}
+```
+
+下面再来看自动注入(by_type)的代码：
+
+```java
+protected void autowireByType(
+      String beanName, AbstractBeanDefinition mbd, BeanWrapper bw, MutablePropertyValues pvs) {
+
+   // 类型转换器获取
+   //TypeConverter是定义类型转换的接口
+   TypeConverter converter = getCustomTypeConverter();
+   if (converter == null) {
+      //BeanWrapper是TypeConverter的子接口
+      converter = bw;
+   }
+
+   Set<String> autowiredBeanNames = new LinkedHashSet<>(4);
+   //拿到所有属性描述符的名字
+   String[] propertyNames = unsatisfiedNonSimpleProperties(mbd, bw);
+   for (String propertyName : propertyNames) {
+      try {
+         //得到对应属性名字的属性描述
+         PropertyDescriptor pd = bw.getPropertyDescriptor(propertyName);
+         // Don't try autowiring by type for type Object: never makes sense,
+         // even if it technically is a unsatisfied, non-simple property.
+         // 如果是Object，就不管了,object类型的不能自动注入
+         if (Object.class != pd.getPropertyType()) {
+            //获取属性set方法对象包装（里面包含方法名）
+            MethodParameter methodParam = BeanUtils.getWriteMethodParameter(pd);
+            // Do not allow eager init for type matching in case of a prioritized post-processor.
+            // 是否立即初始化
+            boolean eager = !(bw.getWrappedInstance() instanceof PriorityOrdered);
+            // 依赖描述
+            DependencyDescriptor desc = new AutowireByTypeDependencyDescriptor(methodParam, eager);
+            // 解析依赖，获取依赖对应的对象
+            Object autowiredArgument = resolveDependency(desc, beanName, autowiredBeanNames, converter);
+            if (autowiredArgument != null) {
+               //加入到MutablePropertyValues中，等待applyPropertyValues(beanName, mbd, bw, pvs);统一赋值
+               pvs.add(propertyName, autowiredArgument);
+            }
+            for (String autowiredBeanName : autowiredBeanNames) {
+               // 注册依赖
+               registerDependentBean(autowiredBeanName, beanName);
+               if (logger.isTraceEnabled()) {
+                  logger.trace("Autowiring by type from bean name '" + beanName + "' via property '" +
+                        propertyName + "' to bean named '" + autowiredBeanName + "'");
+               }
+            }
+            autowiredBeanNames.clear();
+         }
+      }
+      catch (BeansException ex) {
+         throw new UnsatisfiedDependencyException(mbd.getResourceDescription(), beanName, propertyName, ex);
+      }
+   }
+}
+```
+
+关键代码在unsatisfiedNonSimpleProperties方法
+
+```java
+protected String[] unsatisfiedNonSimpleProperties(AbstractBeanDefinition mbd, BeanWrapper bw) {
+   Set<String> result = new TreeSet<>();
+   //得到需要设置值的所有属性的键值对
+   PropertyValues pvs = mbd.getPropertyValues();
+   /**
+    * 获取当前bean的属性描述(必然包含当前类的class描述，它也是属性)
+    * pd.getWriteMethod() 会获取当前属性set方法对象
+    * pd.getPropertyType() 获取当前属性的类型
+    * isExcludedFromDependencyCheck 当前属性是否被排除（排除cglib生成的类的内部属性，
+    * spring容器的内部属性（实现了spring中的aware接口），这个需要通过BeanPostProcessor接口注入）
+    * !pvs.contains(pd.getName()) 已有的属性集合中不包含（非手动注入过的属性）
+    * !BeanUtils.isSimpleProperty(pd.getPropertyType()) 非简单属性
+    */
+
+   //调用jdk中的方法，拿到bw对应类的beanInfo信息，包含了类中所有对属性的描述方法(get or set)
+   //==beanInfo.getPropertyDescriptors
+   PropertyDescriptor[] pds = bw.getPropertyDescriptors();
+   for (PropertyDescriptor pd : pds) {
+      if (pd.getWriteMethod() != null && !isExcludedFromDependencyCheck(pd) && !pvs.contains(pd.getName()) &&
+            !BeanUtils.isSimpleProperty(pd.getPropertyType())) {
+         result.add(pd.getName());
+      }
+   }
+   return StringUtils.toStringArray(result);
+}
+```
+
+```java
+public PropertyDescriptor[] getPropertyDescriptors() {
+   return getCachedIntrospectionResults().getPropertyDescriptors();
+}
+```
+
+
+
+```java
+private CachedIntrospectionResults getCachedIntrospectionResults() {
+   if (this.cachedIntrospectionResults == null) {
+      //内省，获取javabean对象属性信息
+      this.cachedIntrospectionResults = CachedIntrospectionResults.forClass(getWrappedClass());
+   }
+   return this.cachedIntrospectionResults;
+}
+```
+
+通过spring封装的内省工具类cachedIntrospectionResults的静态方法forClass(beanClass)，得到所有属性描述PropertyDescriptor，然后获取指定属性的属性描述，封装为属性处理器BeanPropertyHandler
+
+CachedIntrospectionResults这个类中封装了内省的结果，并且提供了方法方便获取内省的结果。
+
+继续来看forClass方法
+
+```java
+static CachedIntrospectionResults forClass(Class<?> beanClass) throws BeansException {
+   //先从缓存中获取
+   CachedIntrospectionResults results = strongClassCache.get(beanClass);
+   if (results != null) {
+      return results;
+   }
+   results = softClassCache.get(beanClass);
+   if (results != null) {
+      return results;
+   }
+
+   //创建一个beanClass的可缓存的内省结果
+   //在这个new的过程中已经把所有的属性描述找出来了
+   results = new CachedIntrospectionResults(beanClass);
+   ConcurrentMap<Class<?>, CachedIntrospectionResults> classCacheToUse;
+
+   //使用当前类加载器加载的是缓存安全的
+   if (ClassUtils.isCacheSafe(beanClass, CachedIntrospectionResults.class.getClassLoader()) ||
+         isClassLoaderAccepted(beanClass.getClassLoader())) {
+      classCacheToUse = strongClassCache;
+   }
+   //不安全
+   else {
+      if (logger.isDebugEnabled()) {
+         logger.debug("Not strongly caching class [" + beanClass.getName() + "] because it is not cache-safe");
+      }
+      classCacheToUse = softClassCache;
+   }
+
+   //缓存
+   CachedIntrospectionResults existing = classCacheToUse.putIfAbsent(beanClass, results);
+   return (existing != null ? existing : results);
+}
+```
+
+在CachedIntrospectionResults的构造方法中就获取了beanClass类的内省结果
+
+```java
+private CachedIntrospectionResults(Class<?> beanClass) throws BeansException {
+   try {
+      if (logger.isTraceEnabled()) {
+         logger.trace("Getting BeanInfo for class [" + beanClass.getName() + "]");
+      }
+      //内省获取BeanInfo
+      this.beanInfo = getBeanInfo(beanClass);
+
+      if (logger.isTraceEnabled()) {
+         logger.trace("Caching PropertyDescriptors for class [" + beanClass.getName() + "]");
+      }
+      this.propertyDescriptors = new LinkedHashMap<>();
+
+      // This call is slow so we do it once.
+      //获取beanClass中所有PropertyDescriptor（原生或spring增强的）
+      PropertyDescriptor[] pds = this.beanInfo.getPropertyDescriptors();
+      for (PropertyDescriptor pd : pds) {
+         if (Class.class == beanClass && !("name".equals(pd.getName()) ||
+               (pd.getName().endsWith("Name") && String.class == pd.getPropertyType()))) {
+            // Only allow all name variants of Class properties
+            continue;
+         }
+         if (URL.class == beanClass && "content".equals(pd.getName())) {
+            // Only allow URL attribute introspection, not content resolution
+            continue;
+         }
+         if (pd.getWriteMethod() == null && isInvalidReadOnlyPropertyType(pd.getPropertyType())) {
+            // Ignore read-only properties such as ClassLoader - no need to bind to those
+            continue;
+         }
+         if (logger.isTraceEnabled()) {
+            logger.trace("Found bean property '" + pd.getName() + "'" +
+                  (pd.getPropertyType() != null ? " of type [" + pd.getPropertyType().getName() + "]" : "") +
+                  (pd.getPropertyEditorClass() != null ?
+                        "; editor [" + pd.getPropertyEditorClass().getName() + "]" : ""));
+         }
+         /**
+          * 增强PropertyDescriptor
+          * GenericTypeAwarePropertyDescriptor是spring定义，继承了PropertyDescriptor
+          * 添加了更多的方法，方便获取属性相关的信息
+          */
+         pd = buildGenericTypeAwarePropertyDescriptor(beanClass, pd);
+         //缓存起来
+         this.propertyDescriptors.put(pd.getName(), pd);
+      }
+
+      // Explicitly check implemented interfaces for setter/getter methods as well,
+      // in particular for Java 8 default methods...
+      Class<?> currClass = beanClass;
+      while (currClass != null && currClass != Object.class) {
+         //内省处理接口有默认实现的setter/getter方法
+         introspectInterfaces(beanClass, currClass);
+         currClass = currClass.getSuperclass();
+      }
+
+      this.typeDescriptorCache = new ConcurrentReferenceHashMap<>();
+   }
+   catch (IntrospectionException ex) {
+      throw new FatalBeanException("Failed to obtain BeanInfo for class [" + beanClass.getName() + "]", ex);
+   }
+}
+```
+
+主要方法就是getBeanInfo方法
+
+```java
+private static BeanInfo getBeanInfo(Class<?> beanClass) throws IntrospectionException {
+   /**
+    * spring对原生的内省包装了一下
+    * 返回的BeanInfo类型是spring自己定义的ExtendedBeanInfo，实现更强大的功能，获取更多的信息
+    */
+   for (BeanInfoFactory beanInfoFactory : beanInfoFactories) {
+      BeanInfo beanInfo = beanInfoFactory.getBeanInfo(beanClass);
+      if (beanInfo != null) {
+         return beanInfo;
+      }
+   }
+   //原生，使用的JDK中的Introspector工具类实现内省，返回SimpleBeanInfo，里面方法很少
+   return (shouldIntrospectorIgnoreBeaninfoClasses ?
+         Introspector.getBeanInfo(beanClass, Introspector.IGNORE_ALL_BEANINFO) :
+         Introspector.getBeanInfo(beanClass));
+}
+```
+
+Introspector.getBeanInfo(beanClass))中的逻辑就是上面内省机制的逻辑
+
+最后会根据得到的内省结果得到PropertyDescriptor，获取对应的属性描述，然后调用resolveDependency在spring容器中找到这个属性对应的对象（最终的逻辑是调用beanFactory.getBean(beanName)来获取），然后把得到的对象结果和属性名称添加到MutablePropertyValues中
+
+```java
+pvs.add(propertyName, autowiredArgument);
+```
+
+最后等待applyPropertyValues(beanName, mbd, bw, pvs);统一赋值，到此autowireByType的逻辑大概结束了。
